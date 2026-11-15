@@ -4,6 +4,18 @@ local project = require('overleaf.project')
 local Document = require('overleaf.document')
 local buffer = require('overleaf.buffer')
 local sync = require('overleaf.sync')
+local statusline = require('overleaf.statusline')
+local compile_errors = require('overleaf.compile_errors')
+
+-- lualine
+require('lualine').setup({
+  sections = {
+    lualine_x = {
+      function() return require('overleaf.statusline').status() end,
+      'encoding', 'filetype',  -- keep whatever you already had here
+    },
+  },
+})
 
 local M = {}
 
@@ -277,6 +289,7 @@ function M._connect_project(cookie, project_id, project_name)
     M._state.project_id = project_id
     M._state.project_name = project_name
     M._state.project_data = result.project
+    statusline.set({ connected = true })
 
     -- Parse project tree
     project.parse_project_tree(result.project)
@@ -543,13 +556,31 @@ function M._setup_event_handlers()
     end)
   end)
 
+  local online = {}
+  local function push_users()
+    local t = {}
+    for _, n in pairs(online) do t[#t + 1] = n end
+    table.sort(t)
+    statusline.set({ users = t })
+  end
+
   -- Collaborator cursor tracking
   bridge.on_event('clientUpdated', function(data)
-    vim.schedule(function() require('overleaf.cursors').on_client_updated(data) end)
+    local id = data.id or data.client_id
+    if id then online[id] = data.name or data.first_name or data.email or '?' end
+    vim.schedule(function()
+      push_users()
+      require('overleaf.cursors').on_client_updated(data)
+    end)
   end)
 
   bridge.on_event('clientDisconnected', function(data)
-    vim.schedule(function() require('overleaf.cursors').on_client_disconnected(data) end)
+    local id = type(data) == 'table' and (data.id or data.client_id) or data
+    if id then online[id] = nil end
+    vim.schedule(function()
+      push_users()
+      require('overleaf.cursors').on_client_disconnected(data)
+    end)
   end)
 end
 
@@ -634,6 +665,7 @@ function M._reconnect_to_project(cookie)
     M._state.connected = true
     M._state.project_data = result.project
     M._reconnect.attempt = 0
+    statusline.set({ connected = true, users = {} })
 
     config.log('info', 'Reconnected to: %s', M._state.project_name or '?')
 
@@ -936,7 +968,7 @@ function M._apply_remote_move(entity_id, new_parent_id)
   vim.schedule(function() require('overleaf.tree').refresh() end)
 end
 
-function M.create_doc(name, parent_folder_id)
+function M.create_doc(name, parent_folder_id, on_done)
   if not M._state.connected then
     config.log('warn', 'Not connected.')
     return
@@ -991,6 +1023,7 @@ function M.create_doc(name, parent_folder_id)
           depth = depth,
         })
         require('overleaf.tree').refresh()
+        if on_done then on_done(entry or { id = result._id or result.id, path = full_path }) end
       end)
     end)
   end
@@ -1132,6 +1165,8 @@ end
 local function upload_one(path, parent_id, cb)
   local name = vim.fn.fnamemodify(path, ':t')
   local full_path = project.get_folder_path(parent_id) .. name
+  local name = vim.fn.fnamemodify(path, ':t')
+  print('UPLOAD', name, parent_id, full_path)
 
   if project.path_exists(full_path) and not config.get().upload_overwrite then
     vim.schedule(function() cb('skipped') end)
@@ -1359,6 +1394,271 @@ function M.delete_entity(entry)
   end)
 end
 
+local function diff_hl()
+  vim.api.nvim_set_hl(0, 'OverleafDiffAdd',    { bg = '#1e3a2a' })
+  vim.api.nvim_set_hl(0, 'OverleafDiffDelete', { bg = '#4a2328', fg = '#f38ba8' })
+  vim.api.nvim_set_hl(0, 'OverleafDiffChange', { bg = '#2a2f45' })
+  vim.api.nvim_set_hl(0, 'OverleafDiffText',   { bg = '#5a2d33', bold = true })
+  return 'DiffAdd:OverleafDiffAdd,DiffDelete:OverleafDiffDelete,DiffChange:OverleafDiffChange,DiffText:OverleafDiffText'
+end
+
+local function scratch(lines, name)
+  local b = vim.api.nvim_create_buf(false, true)
+  vim.bo[b].bufhidden, vim.bo[b].filetype = 'wipe', 'tex'
+  vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
+  pcall(vim.api.nvim_buf_set_name, b, name)
+  return b
+end
+
+local function current_lines(path)
+  for _, doc in pairs(M._state.documents) do
+    if doc.path == path and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+      return vim.api.nvim_buf_get_lines(doc.bufnr, 0, -1, false)
+    end
+  end
+  local p = sync.file_path(path)
+  if p and vim.fn.filereadable(p) == 1 then return vim.fn.readfile(p) end
+  return {}
+end
+
+local OPS = {
+  added   = { '+', 'OverleafOn',   'will be DELETED' },
+  removed = { '-', 'OverleafOff',  'will be RESTORED' },
+  edited  = { '~', 'OverleafWarn', 'will be REVERTED' },
+  renamed = { '→', 'OverleafWarn', 'will be renamed back' },
+  bin = { '?', 'OverleafWarn', 'binary: content not compared' },
+  unknown = { '?', 'OverleafWarn', 'could not compare' }
+}
+
+--- Diff ONE changed file: old version (left) vs current (right), in its own tab.
+function M._diff_file(base, version, latest, e)
+  if e.operation == 'renamed' then
+    return config.log('info', 'Rename entry (fields as Overleaf sent them): %s', vim.json.encode(e))
+  end
+  if e.editable == false then
+    return config.log('warn', '%s is a binary file, no text diff', e.pathname)
+  end
+  local function show(old_text)
+    vim.schedule(function()
+      local new = (e.operation == 'removed') and {} or current_lines(e.newPathname or e.pathname)
+      vim.cmd('tabnew')
+      local old_buf = scratch(vim.split(old_text, '\n', { plain = true }), ('overleaf-v%s:%s'):format(version, e.pathname))
+      vim.api.nvim_win_set_buf(0, old_buf)
+      local lw = vim.api.nvim_get_current_win()
+      vim.cmd('vsplit')
+      local new_buf = scratch(new, 'overleaf-now:' .. (e.newPathname or e.pathname))
+      vim.api.nvim_win_set_buf(0, new_buf)
+      local rw = vim.api.nvim_get_current_win()
+      local wh = diff_hl()
+      for _, w in ipairs({ lw, rw }) do
+        vim.api.nvim_set_current_win(w)
+        vim.cmd('diffthis')
+        vim.wo[w].winhighlight = wh
+      end
+      vim.wo[lw].winbar = (' v%s (old) — %s'):format(version, e.pathname)
+      vim.wo[rw].winbar = ' now · q closes this diff'
+      for _, b in ipairs({ old_buf, new_buf }) do
+        vim.keymap.set('n', 'q', '<cmd>diffoff! | tabclose<cr>', { buffer = b })
+      end
+    end)
+  end
+
+  if e.operation == 'added' then return show('') end -- did not exist at that version
+  bridge.request('getFileDiff', vim.tbl_extend('force', base,
+    { from = version, to = (e.operation == 'removed') and version or latest, pathname = e.pathname }), function(err, res)
+    local old = {}
+    if err then
+      config.log('warn', 'No old text for %s: %s', e.pathname, err.message or vim.inspect(err))
+    else
+      for _, d in ipairs(res.diff or {}) do
+        if d.u then old[#old + 1] = d.u elseif d.d then old[#old + 1] = d.d end
+      end
+    end
+    show(table.concat(old))
+  end)
+end
+
+local function tree_at(base, v, cb)
+  bridge.request('getFiletreeDiff', vim.tbl_extend('force', base, { from = v, to = v }), function(err, res)
+    if err then return cb(err) end
+    local m = {}
+    for _, e in ipairs(res.diff or {}) do m[e.pathname] = e end
+    cb(nil, m)
+  end)
+end
+
+local function run_pool(items, limit, worker, done)
+  local n, i, running, finished = #items, 0, 0, 0
+  if n == 0 then return done() end
+  local function launch()
+    while running < limit and i < n do
+      i = i + 1; running = running + 1
+      worker(items[i], function()
+        running = running - 1; finished = finished + 1
+        if finished == n then done() else launch() end
+      end)
+    end
+  end
+  launch()
+end
+
+function M._diff_against(base, version, latest)
+  config.log('info', 'Comparing v%s with now (by content)...', version)
+  tree_at(base, version, function(err, A)
+    if err then return config.log('error', 'Tree at v%s failed: %s', version, err.message or vim.inspect(err)) end
+    tree_at(base, latest, function(err2, B)
+      if err2 then return config.log('error', 'Tree at v%s failed: %s', latest, err2.message or vim.inspect(err2)) end
+      local changed, todo, binary = {}, {}, 0
+      for p, e in pairs(B) do
+        if not A[p] then changed[#changed + 1] = { pathname = p, operation = 'added', editable = e.editable } end
+      end
+      for p, e in pairs(A) do
+        if not B[p] then changed[#changed + 1] = { pathname = p, operation = 'removed', editable = e.editable }
+        elseif e.editable == false then binary = binary + 1
+        else todo[#todo + 1] = p end
+      end
+      run_pool(todo, 5, function(p, done)
+        bridge.request('getFileDiff', vim.tbl_extend('force', base,
+          { from = version, to = latest, pathname = p }), function(e3, res)
+          if e3 then
+            changed[#changed + 1] = { pathname = p, operation = 'unknown' }
+          else
+            for _, d in ipairs(res.diff or {}) do
+              if d.i or d.d then changed[#changed + 1] = { pathname = p, operation = 'edited' }; break end
+            end
+          end
+          done()
+        end)
+      end, function()
+        table.sort(changed, function(a, b) return a.pathname < b.pathname end)
+        local note = binary > 0 and (' (%d binary files not compared)'):format(binary) or ''
+        M._render_summary(base, version, latest, changed, note)
+      end)
+    end)
+  end)
+end
+
+--- Summary of EVERY change between `version` and now; <CR> diffs a file, <leader>R restores.
+function M._render_summary(base, version, latest, changed, note) 
+    vim.schedule(function()
+      if #changed == 0 then return config.log('warn', 'No differences between v%s and now', version) end
+      local head = {
+        ('Overleaf: v%s → now — %d changed files%s'):format(version, #changed, note or ''),
+        '<CR> diff file · <leader>R restore WHOLE project to this version · q close',
+        '',
+      }
+      local lines = vim.deepcopy(head)
+      for _, e in ipairs(changed) do
+        local o = OPS[e.operation] or { '?', 'OverleafWarn', 'unknown operation: ' .. tostring(e.operation) }
+        local target = e.operation == 'renamed' and ('  ' .. vim.json.encode(e)) or ''
+        lines[#lines + 1] = ('%s %s%s   (%s)'):format(o[1], e.pathname, target, o[3])
+      end
+
+      vim.cmd('tabnew')
+      local buf = vim.api.nvim_get_current_buf()
+      vim.bo[buf].buftype, vim.bo[buf].bufhidden = 'nofile', 'wipe'
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      vim.bo[buf].modifiable = false
+      for i, e in ipairs(changed) do
+        local o = OPS[e.operation] or { '?', 'OverleafWarn' }
+        vim.api.nvim_buf_add_highlight(buf, -1, o[2], #head + i - 1, 0, -1)
+      end
+
+      local function map(lhs, fn) vim.keymap.set('n', lhs, fn, { buffer = buf, nowait = true }) end
+      map('q', '<cmd>tabclose<cr>')
+      map('<CR>', function()
+        local e = changed[vim.api.nvim_win_get_cursor(0)[1] - #head]
+        if e then M._diff_file(base, version, latest, e) end
+      end)
+      map('<leader>R', function()
+        vim.ui.input({ prompt = ('Restore WHOLE project to v%s (%d files change)? (y/N): '):format(version, #changed) }, function(a)
+          if a ~= 'y' and a ~= 'Y' then return end
+          vim.cmd('tabclose')
+          M._revert_project(base, version)
+        end)
+      end)
+    end)
+end
+
+local function in_tree(id)
+  for _, e in ipairs(project._project_tree) do
+    if e.id == id and e.type == 'doc' then return true end
+  end
+  return false
+end
+
+local function wipe_all_docs()
+  for id, doc in pairs(M._state.documents) do
+    M._state.documents[id] = nil
+    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+      pcall(vim.api.nvim_buf_delete, doc.bufnr, { force = true })
+    end
+  end
+end
+
+function M._revert_project(base, version)
+  -- refuse if anything is unsynced; back up all open buffers first
+  for _, doc in pairs(M._state.documents) do
+    if doc.inflight_op or (doc.pending_ops and #doc.pending_ops > 0) then
+      return config.log('warn', 'Unsynced edits in %s — wait a moment and retry', doc.path)
+    end
+  end
+  local bdir = vim.fn.stdpath('state') .. '/overleaf-restore-backup/' .. os.date('%Y%m%d-%H%M%S')
+  for _, doc in pairs(M._state.documents) do
+    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+      local dest = bdir .. '/' .. doc.path
+      vim.fn.mkdir(vim.fn.fnamemodify(dest, ':h'), 'p')
+      vim.fn.writefile(vim.api.nvim_buf_get_lines(doc.bufnr, 0, -1, false), dest)
+    end
+  end
+
+  -- remember what was open, by path (ids may change after a restore)
+  local open = {}
+  for _, doc in pairs(M._state.documents) do
+    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then open[#open + 1] = doc.path end
+  end
+
+  bridge.request('revertProject', vim.tbl_extend('force', base, { version = version }), function(err)
+    if err then return config.log('error', 'Revert failed: %s', err.message or vim.inspect(err)) end
+    config.log('info', 'Restored to v%s, reloading...', version)
+
+    vim.defer_fn(function()
+      wipe_all_docs()
+      vim.cmd('Overleaf sync')
+
+      -- reopen what still exists once the synced tree knows about it
+      local pending, tries = open, 0
+      local function reopen()
+        tries = tries + 1
+        local left = {}
+        for _, p in ipairs(pending) do
+          local info = project.get_doc_by_path(p)
+          if info and in_tree(info.id) and not M._state.documents[info.id] then
+            M.open_document(info.id, info.path)
+          else
+            left[#left + 1] = p
+          end
+        end
+        pending = left
+        if #pending > 0 and tries < 20 then vim.defer_fn(reopen, 500) end
+      end
+      vim.defer_fn(reopen, 2000)
+
+      -- final sweep: no buffer may point at a doc that is not in the tree
+      vim.defer_fn(function()
+        for id, doc in pairs(M._state.documents) do
+          if not in_tree(id) then
+            M._state.documents[id] = nil
+            if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+              pcall(vim.api.nvim_buf_delete, doc.bufnr, { force = true })
+            end
+          end
+        end
+      end, 15000)
+    end, 3000)
+  end)
+end
+
 function M.history()
   if not M._state.connected then
     config.log('warn', 'Not connected.')
@@ -1410,6 +1710,13 @@ function M._show_history(updates)
     })
   end
 
+  local latest = updates[1].toV  -- assumes newest first, as the API returns it
+  local base = {
+    cookie = config.get().cookie,
+    csrfToken = M._state.csrf_token,
+    projectId = M._state.project_id,
+  }
+
   vim.ui.select(items, {
     prompt = 'Project History:',
     format_item = function(item)
@@ -1418,11 +1725,12 @@ function M._show_history(updates)
     end,
   }, function(choice)
     if not choice then return end
-    config.log('info', 'Version range: v%d -> v%d', choice.fromV, choice.toV)
+    M._diff_against(base, choice.toV, latest)
   end)
 end
 
 function M.compile()
+  statusline.set({ compile = 'running' })
   if not M._state.connected then
     config.log('warn', 'Not connected. Run :Overleaf connect first.')
     return
@@ -1725,6 +2033,9 @@ function M._compile_local()
               log_text = f:read('*a')
               f:close()
               M._parse_compile_log(log_text)
+              local errs = compile_errors.parse_log(log_text, vim.fn.fnamemodify(log_path, ':h'))
+              vim.fn.setqflist(errs, 'r')
+              statusline.set({ compile = #errs == 0 and 'ok' or 'error' })
             end
           end
 
@@ -2307,6 +2618,7 @@ function M.disconnect()
   M._state.project_id = nil
   M._state.project_data = nil
   M._state.csrf_token = nil
+  statusline.set({ connected = false, users = {} })
 
   config.log('info', 'Disconnected')
 end

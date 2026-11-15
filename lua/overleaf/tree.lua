@@ -181,6 +181,7 @@ function M._delete_entry()
     if answer ~= 'y' and answer ~= 'Y' then return end
     local ol = require('overleaf')
     local bridge = require('overleaf.bridge')
+
     bridge.request('deleteEntity', {
       cookie = require('overleaf.config').get().cookie,
       csrfToken = ol._state.csrf_token,

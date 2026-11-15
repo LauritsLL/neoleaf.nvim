@@ -23,6 +23,16 @@ local subcommands = {
     end
   end,
   history = function() require('overleaf').history() end,
+  errors = function()
+    local o = require('overleaf')
+    local sd = require('overleaf.config').get().sync_dir
+    if not sd then return vim.notify('sync_dir not configured', vim.log.levels.WARN) end
+    sd = vim.fn.expand(sd)
+    local log = vim.fn.glob(sd .. '/**/*.log', false, true)
+    -- pick the newest .log; adjust if your main.log path is fixed
+    table.sort(log, function(a, b) return vim.fn.getftime(a) > vim.fn.getftime(b) end)
+    if log[1] then require('overleaf.compile_errors').show(log[1], vim.fn.fnamemodify(log[1], ':h')) end
+  end,
   sync = function(args)
     if args == 'import' then
       require('overleaf').sync_import()

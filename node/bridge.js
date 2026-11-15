@@ -297,6 +297,36 @@ const handlers = {
     return JSON.parse(res.body);
   },
 
+  async getFiletreeDiff(params) {
+    const { cookie, projectId, from, to } = params;
+    const res = await auth.httpGet(
+      `${BASE_URL}/project/${projectId}/filetree/diff?from=${from}&to=${to}`,
+      cookie
+    );
+    if (res.status !== 200) throw { code: 'TREE_DIFF_FAILED', message: `Filetree diff failed: ${res.status}` };
+    return JSON.parse(res.body);
+  },
+
+  async getFileDiff(params) {
+    const { cookie, projectId, from, to, pathname } = params;
+    const res = await auth.httpGet(
+      `${BASE_URL}/project/${projectId}/diff?from=${from}&to=${to}&pathname=${encodeURIComponent(pathname)}`,
+      cookie
+    );
+    if (res.status !== 200) throw { code: 'DIFF_FAILED', message: `Diff failed: ${res.status}` };
+    return JSON.parse(res.body);
+  },
+
+  async revertProject(params) {
+    const { cookie, csrfToken, projectId, version } = params;
+    const res = await auth.httpPost(
+      `${BASE_URL}/project/${projectId}/revert-project`,
+      cookie, csrfToken, { version }
+    );
+    if (res.status >= 300) throw { code: 'REVERT_FAILED', message: `Revert failed: ${res.status} ${res.body}` };
+    return {};
+  },
+
   async getThreads(params) {
     const { cookie, projectId } = params;
     if (!cookie || !projectId) {
