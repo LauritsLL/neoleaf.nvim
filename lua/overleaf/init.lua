@@ -1452,6 +1452,15 @@ function M._diff_file(base, version, latest, e)
       local wh = diff_hl()
       for _, w in ipairs({ lw, rw }) do
         vim.api.nvim_set_current_win(w)
+        vim.opt.diffopt:append({ 'followwrap', 'filler', 'linematch:60' })
+        for _, w in ipairs({ lw, rw }) do
+          vim.wo[w].wrap = true
+          vim.wo[w].linebreak = true
+          vim.wo[w].breakindent = true
+          vim.wo[w].scrollbind = false
+          vim.wo[w].cursorbind = true
+          vim.wo[w].foldenable = true
+        end
         vim.cmd('diffthis')
         vim.wo[w].winhighlight = wh
       end
@@ -1459,19 +1468,26 @@ function M._diff_file(base, version, latest, e)
       vim.wo[rw].winbar = ' now · q closes this diff'
       for _, b in ipairs({ old_buf, new_buf }) do
         vim.keymap.set('n', 'q', '<cmd>diffoff! | tabclose<cr>', { buffer = b })
+        for _, key in ipairs({ 'zo', 'zc', 'za', 'zO', 'zC', 'zA', 'zR', 'zM' }) do
+          vim.keymap.set('n', key, function()
+            for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+              vim.api.nvim_win_call(w, function() pcall(vim.cmd, 'normal! ' .. key) end)
+            end
+          end, { buffer = b, desc = 'fold: both windows' })
+        end
       end
     end)
   end
 
   if e.operation == 'added' then return show('') end -- did not exist at that version
   bridge.request('getFileDiff', vim.tbl_extend('force', base,
-    { from = version, to = (e.operation == 'removed') and version or latest, pathname = e.pathname }), function(err, res)
+    { from = version, to = version, pathname = e.pathname }), function(err, res)
     local old = {}
     if err then
       config.log('warn', 'No old text for %s: %s', e.pathname, err.message or vim.inspect(err))
     else
       for _, d in ipairs(res.diff or {}) do
-        if d.u then old[#old + 1] = d.u elseif d.d then old[#old + 1] = d.d end
+        if d.u then old[#old + 1] = d.u end
       end
     end
     show(table.concat(old))
@@ -1502,6 +1518,17 @@ local function run_pool(items, limit, worker, done)
   launch()
 end
 
+local function text_at(base, v, p, cb)
+  bridge.request('getFileDiff', vim.tbl_extend('force', base, { from = v, to = v, pathname = p }), function(err, res)
+    if err then return cb(err) end
+    local t = {}
+    for _, d in ipairs(res.diff or {}) do
+      if d.u then t[#t + 1] = d.u end
+    end
+    cb(nil, table.concat(t))
+  end)
+end
+
 function M._diff_against(base, version, latest)
   config.log('info', 'Comparing v%s with now (by content)...', version)
   tree_at(base, version, function(err, A)
@@ -1518,18 +1545,21 @@ function M._diff_against(base, version, latest)
         else todo[#todo + 1] = p end
       end
       run_pool(todo, 5, function(p, done)
-        bridge.request('getFileDiff', vim.tbl_extend('force', base,
-          { from = version, to = latest, pathname = p }), function(e3, res)
-          if e3 then
-            changed[#changed + 1] = { pathname = p, operation = 'unknown' }
-          else
-            for _, d in ipairs(res.diff or {}) do
-              if d.i or d.d then changed[#changed + 1] = { pathname = p, operation = 'edited' }; break end
+          text_at(base, version, p, function(e1, old)
+            if e1 then
+              changed[#changed + 1] = { pathname = p, operation = 'unknown' }
+              return done()
             end
-          end
-          done()
-        end)
-      end, function()
+            text_at(base, latest, p, function(e2, new)
+              if e2 then
+                changed[#changed + 1] = { pathname = p, operation = 'unknown' }
+              elseif old ~= new then
+                changed[#changed + 1] = { pathname = p, operation = 'edited' }
+              end
+              done()
+            end)
+          end)
+        end, function()
         table.sort(changed, function(a, b) return a.pathname < b.pathname end)
         local note = binary > 0 and (' (%d binary files not compared)'):format(binary) or ''
         M._render_summary(base, version, latest, changed, note)
