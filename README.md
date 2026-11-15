@@ -1,4 +1,3 @@
-
 # overleaf.nvim
  
 Neovim plugin for real-time collaborative LaTeX editing on [Overleaf](https://www.overleaf.com).
@@ -24,8 +23,9 @@ Edit your Overleaf projects directly in Neovim with full real-time collaboration
 - **Comments & reviews** — view, reply, resolve comment threads
 - **Collaborator cursors** — see where other users are editing
 - **Project-wide search** — grep across all documents
-- **History** — view project version history
-- **Diagnostics** — chktex linter + LaTeX compile errors via `vim.diagnostic`
+- **History diff and restore** — compare the whole project against any past version by content, review each changed file side by side, and restore the project to that version
+- **Statusline component** — colourful connection, collaborator and compile status for lualine or any statusline
+- **Diagnostics** — chktex linter + LaTeX compile errors via `vim.diagnostic`, and every compile error in the quickfix list
 - **LSP support** — auto-attaches texlab, ltex, harper_ls to overleaf buffers
 - **Local file sync** — mirror documents to disk for external tools (Claude Code, etc.)
 - **Multi-file project support** — automatic main file detection and configuration
@@ -121,7 +121,8 @@ To get the cookie manually: open overleaf.com in your browser → DevTools (F12)
 | `:Overleaf search [pattern]` | Search across all documents |
 | `:Overleaf comments` | List all comments |
 | `:Overleaf comments refresh` | Refresh comments from server |
-| `:Overleaf history` | View project history |
+| `:Overleaf history` | Pick a past version, review what differs from now, optionally restore it |
+| `:Overleaf errors` | Put the compile errors from the latest LaTeX log in the quickfix list and jump to the first |
 | `:Overleaf sync` | Sync all documents to/from disk |
 | `:Overleaf sync import` | Import external changes from disk to Overleaf |
 | `:Overleaf sync export` | Export all documents to disk |
@@ -204,6 +205,59 @@ When someone renames or moves a file or folder on Overleaf, the plugin applies t
 - open buffers keep working: their path, buffer name and file watcher are updated
 If the target already exists on disk, the plugin leaves the old path in place and warns instead of overwriting anything.
  
+### History: diff and restore
+
+`:Overleaf history` lists the project's recent versions (newest first, 40 at a time). Pick one and the plugin compares **the whole project** against it:
+
+- A summary tab lists every file that differs, with what a restore would do to it: `+` *will be DELETED* (exists now, not then), `-` *will be RESTORED* (existed then, gone now), `~` *will be REVERTED* (content differs). Unchanged files are not listed.
+- The comparison is by **path and content**, not by Overleaf's own change labels. After an earlier restore Overleaf reports re-created files as "added" even when nothing changed; comparing the text at both versions avoids that.
+- Binary files (images, PDFs) cannot be compared as text. They are only counted in the header, so check those in Overleaf's own history. A renamed file shows up as one `-` and one `+`.
+- A file that could not be compared is shown as `?`, never hidden.
+
+In the summary tab:
+
+| Key | Description |
+|-----|-------------|
+| `<CR>` | Open a side-by-side diff of the file under the cursor (old version left, current right) in its own tab |
+| `<leader>R` | Restore the **whole project** to this version (asks `y/N`, shows how many files change) |
+| `q` | Close |
+
+In a file diff: lines wrap at word boundaries, the two cursors move together, `]c` / `[c` jump between changes, `zo` `zc` `za` `zR` `zM` open and close folds in **both** windows, and `q` returns to the summary.
+
+**Restoring** calls Overleaf's own "restore project" for the chosen version, which Overleaf records as a new version, so it can be undone from History. Before it runs:
+
+- it refuses if any open document still has unsynced edits (wait a moment and retry);
+- every open buffer is saved to `~/.local/state/nvim/overleaf-restore-backup/<timestamp>/`.
+
+Afterwards all Overleaf buffers are wiped, the project is re-synced, and the files you had open are reopened if they still exist, so no buffer is left pointing at a file that is gone. Windows showing those buffers close.
+
+### Statusline
+
+`require('overleaf.statusline').status()` returns a coloured string with the connection state, the collaborators who are online, and the compile result (`⟳` running, `✔` ok, `✘` errors). It is empty while you are not connected, so your normal statusline stays untouched.
+
+lualine:
+
+```lua
+sections = {
+  lualine_x = {
+    {
+      function() return require('overleaf.statusline').status() end,
+      cond = function() return require('overleaf.statusline').active() end,
+    },
+  },
+}
+```
+
+Without lualine: `vim.o.statusline = '%f %m%=%{%v:lua.require("overleaf.statusline").status()%} %l:%c'`.
+
+Colours come from the highlight groups `OverleafOn`, `OverleafOff`, `OverleafUsers` and `OverleafWarn`, which are only defaults; override them in your colourscheme.
+
+### Compile errors
+
+After every local compile the log is parsed. Errors are shown with `vim.diagnostic`, and every error is put in the quickfix list with its file and line. `:Overleaf errors` opens the list and jumps to the first one. Besides `file:line: message` errors it picks up LaTeX `!` errors (`File ... not found`, missing fonts) and a missing `.bib` file.
+
+File and line numbers need `-file-line-error`. The plugin's latexmk arguments should include it, otherwise errors appear without a location.
+
 ### Sync and rejoin behavior
  
 **Downloading the project.** On connect (and on `:Overleaf sync`) every text document is fetched and written to disk, and binary files such as images are downloaded if they are not on disk yet. Document fetches run three at a time and each is retried up to three times. If any still fail, a warning lists exactly which files.
@@ -334,6 +388,8 @@ Claude Code can now read all your LaTeX files and make edits that sync back to O
 - **Compile fails with a font error from `fontspec`:** the font exists on Overleaf but not on your machine. Install it, or use a metric-compatible free font (for example Tinos or Liberation Serif for Times New Roman).
 - **A warning says documents could not be downloaded:** the warning lists them. Run `:Overleaf sync` to retry, and check the log file for the error.
 - **"Rejoin replaced unsynced edits":** your text was saved under `~/.local/state/nvim/overleaf-conflicts/`; copy back what you need.
+- **Restore went wrong:** your open buffers were saved to `~/.local/state/nvim/overleaf-restore-backup/<timestamp>/` first, and the restore itself is a new version in Overleaf's History, so you can restore back.
+- **The history summary shows nearly everything as changed:** check the version you picked. The diff is by content, so a large list means the project really differs from that version.
 - **Anything else:** the full details, including debug output, are in `~/.local/state/nvim/overleaf.log`.
 ## How It Works
  
@@ -360,4 +416,3 @@ The code in this repository is an independent implementation in Lua/Node.js. No 
 ## License
  
 MIT
- 
