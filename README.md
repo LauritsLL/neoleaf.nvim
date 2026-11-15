@@ -16,7 +16,7 @@ Ever wished you could write a thesis in your own editor while your supervisor le
 
 This project grew out of [overleaf.nvim by richwomanbtc](https://github.com/richwomanbtc/overleaf.nvim) and has gone its own way since. Compared with that project's README, this version adds:
 
-| | overleaf.nvim | neoleaf.nvim |
+| | overleaf.nvim | ✨ neoleaf.nvim ✨ |
 |---|---|---|
 | ↩️ **Undo** | Vim's own undo, which can also revert collaborators' text | A custom undo that only touches *your* changes |
 | 🛟 **Sync safety** | Basic OT | Correct transforms for multi-part and overlapping edits, and a rejoin that keeps your unsynced edits |
