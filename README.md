@@ -4,6 +4,26 @@ Neovim plugin for real-time collaborative LaTeX editing on [Overleaf](https://ww
  
 Edit your Overleaf projects directly in Neovim with full real-time collaboration support via Operational Transformation (OT). Use your favorite Neovim plugins — treesitter, LSP, snippets, copilot, and more — while collaborating with others on Overleaf.
  
+## How this differs from the original
+
+This version builds on the original [overleaf.nvim by richwomanbtc](https://github.com/richwomanbtc/overleaf.nvim). The comparison below is against that project's README, so it describes what that README documents. The original may have gained features since.
+
+| Area | Original README | This version |
+|------|-----------------|--------------|
+| **Undo** | Vim's own undo, which can also revert collaborators' text | A custom per-buffer undo that only touches *your* changes and skips a step if a collaborator edited that text |
+| **Sync correctness** | Basic OT | Correct transforms for multi-part edits and overlapping edits, and a rejoin that merges your unsynced edits (or saves them to a `.bak` file) instead of discarding them |
+| **Downloading the project** | Documents are fetched on connect | Every document *and* binary file is pulled to disk, throttled and retried, with a warning that names any file that failed |
+| **File management** | `:Overleaf new`, `mkdir`, `delete` and the tree keys act on a fixed place | They act on the entry under the tree cursor or the file you are editing, and new files appear under their own folder in the tree |
+| **Uploading** | One local file at a time | Several files, globs and paths with spaces, with tab completion; optional auto-upload of new files in the sync folder |
+| **Renames and moves** | Not covered | A collaborator's rename or move updates your tree, your disk and your open buffers |
+| **Compiling** | "Compile LaTeX and open the PDF" | Local latexmk on the synced files, XeLaTeX support, optional compile-on-write, PDF preview with inverse search in Okular |
+| **Compile errors** | Shown via `vim.diagnostic` | Also in the quickfix list with file and line, and `:Overleaf errors` jumps to the first one |
+| **History** | View the project's version history | Compare the whole project against any version by content, review each changed file side by side, and restore the project, with safeguards and a local backup of your open buffers |
+| **Statusline** | None | A colourful connection, collaborator and compile status component for lualine or any statusline |
+| **Logging** | Log level only | A full log file, one-line info messages, and full-text popups for warnings and errors, with no "Press ENTER" prompts |
+
+The installation, authentication and basic usage sections below work as in the original. Where this version differs, the section says so.
+
 ## Features
  
 - **Real-time collaboration** — edits sync instantly with other Overleaf users via OT
